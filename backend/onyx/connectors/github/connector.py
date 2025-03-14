@@ -116,7 +116,7 @@ def _convert_code_file_to_document(
         source=DocumentSource.GITHUB,
         semantic_identifier=file_content.path,  # Use the file path as the identifier
         doc_updated_at=datetime.now(tz=timezone.utc),  # Or try file_content.updated_at if available
-        metadata={"file_size": file_content.size},  # Add file size metadata
+        metadata={"file_size": str(file_content.size)},  # Add file size metadata
     )
 
 
@@ -236,17 +236,30 @@ class GithubConnector(LoadConnector, PollConnector):
             return self._get_all_repos(github_client, attempt_num + 1)
 
     def _fetch_repo_code_files(self, repo: Repository.Repository) -> Iterator[list[Document]]:
-        """Fetches all files from a repository."""
+        """Fetches all files from a repository, handling rate limits."""
 
         def _get_files_recursively(
             directory: str
         ) -> Iterator[ContentFile]:  # Helper function for recursion
-            contents = repo.get_contents(directory)
-            for content in contents:
-                if content.type == "dir":
-                    yield from _get_files_recursively(content.path)  # Recursive call
-                else:
-                    yield content  # Yield all files
+            attempt_num = 0
+            while attempt_num < _MAX_NUM_RATE_LIMIT_RETRIES:
+                try:
+                    contents = repo.get_contents(directory)
+                    for content in contents:
+                        if content.type == "dir":
+                            yield from _get_files_recursively(content.path)  # Recursive call
+                        else:
+                            yield content
+                    return  # Successfully fetched contents, exit retry loop
+                except RateLimitExceededException:
+                    _sleep_after_rate_limit_exception(self.github_client)
+                    attempt_num += 1
+                except GithubException as e:
+                    logger.warning(f"Error fetching contents for {directory} in {repo.name}: {e}")
+                    return  # Exit if it's not a rate limit error
+            else:
+                logger.error(f"Rate limit exceeded too many times while fetching contents for {directory} in {repo.name}")
+                return  # Exit after too many retries
 
         code_files = _get_files_recursively("")  # Start from the root directory
         doc_batch: list[Document] = []
