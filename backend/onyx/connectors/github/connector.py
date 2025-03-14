@@ -13,6 +13,7 @@ from github.GithubException import GithubException
 from github.Issue import Issue
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
+from github.ContentFile import ContentFile
 
 from onyx.configs.app_configs import GITHUB_CONNECTOR_BASE_URL
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
@@ -117,34 +118,6 @@ def _convert_code_file_to_document(
         doc_updated_at=datetime.now(tz=timezone.utc),  # Or try file_content.updated_at if available
         metadata={"file_size": file_content.size},  # Add file size metadata
     )
-
-
-def _fetch_repo_code_files(self, repo: Repository.Repository) -> Iterator[list[Document]]:
-    """Fetches all files from a repository."""
-
-    def _get_files_recursively(
-        directory: str
-    ) -> Iterator[ContentFile]:  # Helper function for recursion
-        contents = repo.get_contents(directory)
-        for content in contents:
-            if content.type == "dir":
-                yield from _get_files_recursively(content.path)  # Recursive call
-            else:
-                yield content  # Yield all files
-
-    code_files = _get_files_recursively("")  # Start from the root directory
-    doc_batch: list[Document] =
-    for file in code_files:
-        try:
-            doc = _convert_code_file_to_document(file, repo.full_name)
-            doc_batch.append(doc)
-            if len(doc_batch) >= self.batch_size:
-                yield doc_batch
-                doc_batch =
-        except Exception as e:
-            logger.warning(f"Error processing file {file.path} in {repo.name}: {e}")
-    if doc_batch:  # Yield any remaining documents
-        yield doc_batch
 
 
 def _fetch_issue_comments(issue: Issue) -> str:
@@ -261,6 +234,33 @@ class GithubConnector(LoadConnector, PollConnector):
         except RateLimitExceededException:
             _sleep_after_rate_limit_exception(github_client)
             return self._get_all_repos(github_client, attempt_num + 1)
+
+    def _fetch_repo_code_files(self, repo: Repository.Repository) -> Iterator[list[Document]]:
+        """Fetches all files from a repository."""
+
+        def _get_files_recursively(
+            directory: str
+        ) -> Iterator[ContentFile]:  # Helper function for recursion
+            contents = repo.get_contents(directory)
+            for content in contents:
+                if content.type == "dir":
+                    yield from _get_files_recursively(content.path)  # Recursive call
+                else:
+                    yield content  # Yield all files
+
+        code_files = _get_files_recursively("")  # Start from the root directory
+        doc_batch: list[Document] = []
+        for file in code_files:
+            try:
+                doc = _convert_code_file_to_document(file, repo.full_name)
+                doc_batch.append(doc)
+                if len(doc_batch) >= self.batch_size:
+                    yield doc_batch
+                    doc_batch = []
+            except Exception as e:
+                logger.warning(f"Error processing file {file.path} in {repo.name}: {e}")
+        if doc_batch:  # Yield any remaining documents
+            yield doc_batch
 
     def _fetch_from_github(
         self, start: datetime | None = None, end: datetime | None = None
