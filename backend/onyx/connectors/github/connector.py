@@ -261,7 +261,8 @@ class GithubConnector(LoadConnector, PollConnector):
                 logger.error(f"Rate limit exceeded too many times while fetching contents for {directory} in {repo.name}")
                 return  # Exit after too many retries
 
-        code_files = _get_files_recursively("")  # Start from the root directory
+        # Skip files >1MB
+        code_files = (f for f in _get_files_recursively("") if f.size < 1_000_000)
         doc_batch: list[Document] = []
         for file in code_files:
             try:
