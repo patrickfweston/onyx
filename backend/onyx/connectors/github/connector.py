@@ -9,11 +9,11 @@ from typing import cast
 from github import Github
 from github import RateLimitExceededException
 from github import Repository
+from github.ContentFile import ContentFile
 from github.GithubException import GithubException
 from github.Issue import Issue
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
-from github.ContentFile import ContentFile
 
 from onyx.configs.app_configs import GITHUB_CONNECTOR_BASE_URL
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
@@ -109,13 +109,19 @@ def _convert_code_file_to_document(
 ) -> Document:
     """Converts a GitHub ContentFile (code file) to a Document."""
 
-    file_url = f"https://github.com/{repo_name}/blob/{file_content.sha}/{file_content.path}"
+    file_url = (
+        f"https://github.com/{repo_name}/blob/{file_content.sha}/{file_content.path}"
+    )
     return Document(
         id=file_url,  # Or use file_content.download_url if available
-        sections=[TextSection(link=file_url, text=file_content.decoded_content.decode() or "")],
+        sections=[
+            TextSection(link=file_url, text=file_content.decoded_content.decode() or "")
+        ],
         source=DocumentSource.GITHUB,
         semantic_identifier=file_content.path,  # Use the file path as the identifier
-        doc_updated_at=datetime.now(tz=timezone.utc),  # Or try file_content.updated_at if available
+        doc_updated_at=datetime.now(
+            tz=timezone.utc
+        ),  # Or try file_content.updated_at if available
         metadata={"file_size": str(file_content.size)},  # Add file size metadata
     )
 
@@ -235,34 +241,46 @@ class GithubConnector(LoadConnector, PollConnector):
             _sleep_after_rate_limit_exception(github_client)
             return self._get_all_repos(github_client, attempt_num + 1)
 
-    def _fetch_repo_code_files(self, repo: Repository.Repository) -> Iterator[list[Document]]:
+    def _fetch_repo_code_files(
+        self, github_client: Github, repo: Repository.Repository
+    ) -> Iterator[list[Document]]:
         """Fetches all files from a repository, handling rate limits."""
 
         def _get_files_recursively(
-            directory: str
+            directory: str, github_client: Github
         ) -> Iterator[ContentFile]:  # Helper function for recursion
             attempt_num = 0
             while attempt_num < _MAX_NUM_RATE_LIMIT_RETRIES:
                 try:
                     contents = repo.get_contents(directory)
+                    if not isinstance(contents, list):
+                        contents = [contents]  # Ensure contents is a list
                     for content in contents:
                         if content.type == "dir":
-                            yield from _get_files_recursively(content.path)  # Recursive call
+                            yield from _get_files_recursively(
+                                content.path, github_client
+                            )  # Recursive call
                         else:
                             yield content
                     return  # Successfully fetched contents, exit retry loop
                 except RateLimitExceededException:
-                    _sleep_after_rate_limit_exception(self.github_client)
+                    _sleep_after_rate_limit_exception(github_client)
                     attempt_num += 1
                 except GithubException as e:
-                    logger.warning(f"Error fetching contents for {directory} in {repo.name}: {e}")
+                    logger.warning(
+                        f"Error fetching contents for {directory} in {repo.name}: {e}"
+                    )
                     return  # Exit if it's not a rate limit error
             else:
-                logger.error(f"Rate limit exceeded too many times while fetching contents for {directory} in {repo.name}")
+                logger.error(
+                    f"Rate limit exceeded too many times while fetching contents for {directory} in {repo.name}"
+                )
                 return  # Exit after too many retries
 
         # Skip files >1MB
-        code_files = (f for f in _get_files_recursively("") if f.size < 1_000_000)
+        code_files = (
+            f for f in _get_files_recursively("", github_client) if f.size < 1_000_000
+        )
         doc_batch: list[Document] = []
         for file in code_files:
             try:
@@ -297,7 +315,7 @@ class GithubConnector(LoadConnector, PollConnector):
         for repo in repos:
             if self.include_code:
                 logger.info(f"Fetching code files for repo: {repo.name}")
-                yield from self._fetch_repo_code_files(repo)
+                yield from self._fetch_repo_code_files(self.github_client, repo)
 
             if self.include_prs:
                 logger.info(f"Fetching PRs for repo: {repo.name}")
