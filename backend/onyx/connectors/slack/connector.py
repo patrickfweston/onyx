@@ -14,6 +14,8 @@ from typing import cast
 from pydantic import BaseModel
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry import ConnectionErrorRetryHandler
+from slack_sdk.http_retry import RetryHandler
 from typing_extensions import override
 
 from onyx.configs.app_configs import ENABLE_EXPENSIVE_EXPERT_CALLS
@@ -26,6 +28,8 @@ from onyx.connectors.exceptions import InsufficientPermissionsError
 from onyx.connectors.exceptions import UnexpectedValidationError
 from onyx.connectors.interfaces import CheckpointConnector
 from onyx.connectors.interfaces import CheckpointOutput
+from onyx.connectors.interfaces import CredentialsConnector
+from onyx.connectors.interfaces import CredentialsProviderInterface
 from onyx.connectors.interfaces import GenerateSlimDocumentOutput
 from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.interfaces import SlimConnector
@@ -38,14 +42,15 @@ from onyx.connectors.models import DocumentFailure
 from onyx.connectors.models import EntityFailure
 from onyx.connectors.models import SlimDocument
 from onyx.connectors.models import TextSection
+from onyx.connectors.slack.onyx_retry_handler import OnyxRedisSlackRetryHandler
 from onyx.connectors.slack.utils import expert_info_from_slack_id
 from onyx.connectors.slack.utils import get_message_link
 from onyx.connectors.slack.utils import make_paginated_slack_api_call_w_retries
 from onyx.connectors.slack.utils import make_slack_api_call_w_retries
 from onyx.connectors.slack.utils import SlackTextCleaner
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
+from onyx.redis.redis_pool import get_redis_client
 from onyx.utils.logger import setup_logger
-
 
 logger = setup_logger()
 
@@ -438,7 +443,11 @@ def _get_all_doc_ids(
 
 class ProcessedSlackMessage(BaseModel):
     doc: Document | None
-    thread_ts: str | None
+    # if the message is part of a thread, this is the thread_ts
+    # otherwise, this is the message_ts. Either way, will be a unique identifier.
+    # In the future, if the message becomes a thread, then the thread_ts
+    # will be set to the message_ts.
+    thread_or_message_ts: str
     failure: ConnectorFailure | None
 
 
@@ -452,6 +461,7 @@ def _process_message(
     msg_filter_func: Callable[[MessageType], bool] = default_msg_filter,
 ) -> ProcessedSlackMessage:
     thread_ts = message.get("thread_ts")
+    thread_or_message_ts = thread_ts or message["ts"]
     try:
         # causes random failures for testing checkpointing / continue on failure
         # import random
@@ -467,16 +477,18 @@ def _process_message(
             seen_thread_ts=seen_thread_ts,
             msg_filter_func=msg_filter_func,
         )
-        return ProcessedSlackMessage(doc=doc, thread_ts=thread_ts, failure=None)
+        return ProcessedSlackMessage(
+            doc=doc, thread_or_message_ts=thread_or_message_ts, failure=None
+        )
     except Exception as e:
         logger.exception(f"Error processing message {message['ts']}")
         return ProcessedSlackMessage(
             doc=None,
-            thread_ts=thread_ts,
+            thread_or_message_ts=thread_or_message_ts,
             failure=ConnectorFailure(
                 failed_document=DocumentFailure(
                     document_id=_build_doc_id(
-                        channel_id=channel["id"], thread_ts=(thread_ts or message["ts"])
+                        channel_id=channel["id"], thread_ts=thread_or_message_ts
                     ),
                     document_link=get_message_link(message, client, channel["id"]),
                 ),
@@ -486,8 +498,12 @@ def _process_message(
         )
 
 
-class SlackConnector(SlimConnector, CheckpointConnector[SlackCheckpoint]):
+class SlackConnector(
+    SlimConnector, CredentialsConnector, CheckpointConnector[SlackCheckpoint]
+):
     FAST_TIMEOUT = 1
+
+    MAX_RETRIES = 7  # arbitrarily selected
 
     def __init__(
         self,
@@ -507,16 +523,49 @@ class SlackConnector(SlimConnector, CheckpointConnector[SlackCheckpoint]):
         # just used for efficiency
         self.text_cleaner: SlackTextCleaner | None = None
         self.user_cache: dict[str, BasicExpertInfo | None] = {}
+        self.credentials_provider: CredentialsProviderInterface | None = None
+        self.credential_prefix: str | None = None
+        self.delay_lock: str | None = None  # the redis key for the shared lock
+        self.delay_key: str | None = None  # the redis key for the shared delay
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
+        raise NotImplementedError("Use set_credentials_provider with this connector.")
+
+    def set_credentials_provider(
+        self, credentials_provider: CredentialsProviderInterface
+    ) -> None:
+        credentials = credentials_provider.get_credentials()
+        tenant_id = credentials_provider.get_tenant_id()
+        self.redis = get_redis_client(tenant_id=tenant_id)
+
+        self.credential_prefix = (
+            f"connector:slack:credential_{credentials_provider.get_provider_key()}"
+        )
+        self.delay_lock = f"{self.credential_prefix}:delay_lock"
+        self.delay_key = f"{self.credential_prefix}:delay"
+
+        # NOTE: slack has a built in RateLimitErrorRetryHandler, but it isn't designed
+        # for concurrent workers. We've extended it with OnyxRedisSlackRetryHandler.
+        connection_error_retry_handler = ConnectionErrorRetryHandler()
+        onyx_rate_limit_error_retry_handler = OnyxRedisSlackRetryHandler(
+            max_retry_count=self.MAX_RETRIES,
+            delay_lock=self.delay_lock,
+            delay_key=self.delay_key,
+            r=self.redis,
+        )
+        custom_retry_handlers: list[RetryHandler] = [
+            connection_error_retry_handler,
+            onyx_rate_limit_error_retry_handler,
+        ]
+
         bot_token = credentials["slack_bot_token"]
-        self.client = WebClient(token=bot_token)
+        self.client = WebClient(token=bot_token, retry_handlers=custom_retry_handlers)
         # use for requests that must return quickly (e.g. realtime flows where user is waiting)
         self.fast_client = WebClient(
             token=bot_token, timeout=SlackConnector.FAST_TIMEOUT
         )
         self.text_cleaner = SlackTextCleaner(client=self.client)
-        return None
+        self.credentials_provider = credentials_provider
 
     def retrieve_all_slim_documents(
         self,
@@ -616,7 +665,7 @@ class SlackConnector(SlimConnector, CheckpointConnector[SlackCheckpoint]):
                 for future in as_completed(futures):
                     processed_slack_message = future.result()
                     doc = processed_slack_message.doc
-                    thread_ts = processed_slack_message.thread_ts
+                    thread_or_message_ts = processed_slack_message.thread_or_message_ts
                     failure = processed_slack_message.failure
                     if doc:
                         # handle race conditions here since this is single
@@ -624,11 +673,13 @@ class SlackConnector(SlimConnector, CheckpointConnector[SlackCheckpoint]):
                         # but since this is single threaded, we won't run into simul
                         # writes. At worst, we can duplicate a thread, which will be
                         # deduped later on.
-                        if thread_ts not in seen_thread_ts:
+                        if thread_or_message_ts not in seen_thread_ts:
                             yield doc
 
-                        assert thread_ts, "found non-None doc with None thread_ts"
-                        seen_thread_ts.add(thread_ts)
+                        assert (
+                            thread_or_message_ts
+                        ), "found non-None doc with None thread_or_message_ts"
+                        seen_thread_ts.add(thread_or_message_ts)
                     elif failure:
                         yield failure
 

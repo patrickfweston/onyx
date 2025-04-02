@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from collections.abc import Iterator
 from datetime import datetime
+from datetime import timezone
 
 from googleapiclient.discovery import Resource  # type: ignore
 
@@ -36,12 +37,12 @@ def _generate_time_range_filter(
 ) -> str:
     time_range_filter = ""
     if start is not None:
-        time_start = datetime.utcfromtimestamp(start).isoformat() + "Z"
+        time_start = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
         time_range_filter += (
             f" and {GoogleFields.MODIFIED_TIME.value} >= '{time_start}'"
         )
     if end is not None:
-        time_stop = datetime.utcfromtimestamp(end).isoformat() + "Z"
+        time_stop = datetime.fromtimestamp(end, tz=timezone.utc).isoformat()
         time_range_filter += f" and {GoogleFields.MODIFIED_TIME.value} <= '{time_stop}'"
     return time_range_filter
 
@@ -122,7 +123,7 @@ def crawl_folders_for_files(
                 end=end,
             ):
                 found_files = True
-                logger.info(f"Found file: {file['name']}")
+                logger.info(f"Found file: {file['name']}, user email: {user_email}")
                 yield RetrievedDriveFile(
                     drive_file=file,
                     user_email=user_email,
@@ -213,10 +214,11 @@ def get_files_in_shared_drive(
         yield file
 
 
-def get_all_files_in_my_drive(
+def get_all_files_in_my_drive_and_shared(
     service: GoogleDriveService,
     update_traversed_ids_func: Callable,
     is_slim: bool,
+    include_shared_with_me: bool,
     start: SecondsSinceUnixEpoch | None = None,
     end: SecondsSinceUnixEpoch | None = None,
 ) -> Iterator[GoogleDriveFileType]:
@@ -228,7 +230,8 @@ def get_all_files_in_my_drive(
     # Get all folders being queried and add them to the traversed set
     folder_query = f"mimeType = '{DRIVE_FOLDER_TYPE}'"
     folder_query += " and trashed = false"
-    folder_query += " and 'me' in owners"
+    if not include_shared_with_me:
+        folder_query += " and 'me' in owners"
     found_folders = False
     for file in execute_paginated_retrieval(
         retrieval_function=service.files().list,
@@ -245,7 +248,8 @@ def get_all_files_in_my_drive(
     # Then get the files
     file_query = f"mimeType != '{DRIVE_FOLDER_TYPE}'"
     file_query += " and trashed = false"
-    file_query += " and 'me' in owners"
+    if not include_shared_with_me:
+        file_query += " and 'me' in owners"
     file_query += _generate_time_range_filter(start, end)
     yield from execute_paginated_retrieval(
         retrieval_function=service.files().list,
