@@ -420,7 +420,7 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
         is_slim: bool,
         checkpoint: GoogleDriveCheckpoint,
         concurrent_drive_itr: Callable[[str], Iterator[str]],
-        filtered_folder_ids: set[str],
+        sorted_filtered_folder_ids: list[str],
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,
     ) -> Iterator[RetrievedDriveFile]:
@@ -445,6 +445,9 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
                 logger.warning(
                     f"User '{user_email}' does not have access to the drive APIs."
                 )
+                # mark this user as done so we don't try to retrieve anything for them
+                # again
+                curr_stage.stage = DriveRetrievalStage.DONE
                 return
             raise
 
@@ -506,6 +509,7 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
                 yield from _yield_from_drive(drive_id, start)
             curr_stage.stage = DriveRetrievalStage.FOLDER_FILES
             resuming = False  # we are starting the next stage for the first time
+
         if curr_stage.stage == DriveRetrievalStage.FOLDER_FILES:
 
             def _yield_from_folder_crawl(
@@ -523,16 +527,28 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
                 )
 
             # resume from a checkpoint
+            last_processed_folder = None
             if resuming:
                 folder_id = curr_stage.completed_until_parent_id
                 assert folder_id is not None, "folder id not set in checkpoint"
                 resume_start = curr_stage.completed_until
                 yield from _yield_from_folder_crawl(folder_id, resume_start)
+                last_processed_folder = folder_id
 
-            remaining_folders = filtered_folder_ids - self._retrieved_ids
-            for folder_id in remaining_folders:
+            skipping_seen_folders = last_processed_folder is not None
+            for folder_id in sorted_filtered_folder_ids:
+                if skipping_seen_folders:
+                    skipping_seen_folders = folder_id != last_processed_folder
+                    continue
+
+                if folder_id in self._retrieved_ids:
+                    continue
+
+                curr_stage.completed_until = 0
+                curr_stage.completed_until_parent_id = folder_id
                 logger.info(f"Getting files in folder '{folder_id}' as '{user_email}'")
                 yield from _yield_from_folder_crawl(folder_id, start)
+
         curr_stage.stage = DriveRetrievalStage.DONE
 
     def _manage_service_account_retrieval(
@@ -581,19 +597,44 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
             drive_ids_to_retrieve, checkpoint
         )
 
+        sorted_filtered_folder_ids = sorted(folder_ids_to_retrieve)
+
+        # only process emails that we haven't already completed retrieval for
+        non_completed_org_emails = [
+            user_email
+            for user_email, stage_completion in checkpoint.completion_map.items()
+            if stage_completion.stage != DriveRetrievalStage.DONE
+        ]
+
+        # don't process too many emails before returning a checkpoint. This is
+        # to resolve the case where there are a ton of emails that don't have access
+        # to the drive APIs. Without this, we could loop through these emails for
+        # more than 3 hours, causing a timeout and stalling progress.
+        email_batch_takes_us_to_completion = True
+        MAX_EMAILS_TO_PROCESS_BEFORE_CHECKPOINTING = 50
+        if len(non_completed_org_emails) > MAX_EMAILS_TO_PROCESS_BEFORE_CHECKPOINTING:
+            non_completed_org_emails = non_completed_org_emails[
+                :MAX_EMAILS_TO_PROCESS_BEFORE_CHECKPOINTING
+            ]
+            email_batch_takes_us_to_completion = False
+
         user_retrieval_gens = [
             self._impersonate_user_for_retrieval(
                 email,
                 is_slim,
                 checkpoint,
                 drive_id_iterator,
-                folder_ids_to_retrieve,
+                sorted_filtered_folder_ids,
                 start,
                 end,
             )
-            for email in all_org_emails
+            for email in non_completed_org_emails
         ]
         yield from parallel_yield(user_retrieval_gens, max_workers=MAX_DRIVE_WORKERS)
+
+        # if there are more emails to process, don't mark as complete
+        if not email_batch_takes_us_to_completion:
+            return
 
         remaining_folders = (
             drive_ids_to_retrieve | folder_ids_to_retrieve
@@ -811,14 +852,13 @@ class GoogleDriveConnector(SlimConnector, CheckpointConnector[GoogleDriveCheckpo
             return
 
         for file in drive_files:
-            if file.error is None:
-                checkpoint.completion_map[file.user_email].update(
-                    stage=file.completion_stage,
-                    completed_until=datetime.fromisoformat(
-                        file.drive_file[GoogleFields.MODIFIED_TIME.value]
-                    ).timestamp(),
-                    completed_until_parent_id=file.parent_id,
-                )
+            checkpoint.completion_map[file.user_email].update(
+                stage=file.completion_stage,
+                completed_until=datetime.fromisoformat(
+                    file.drive_file[GoogleFields.MODIFIED_TIME.value]
+                ).timestamp(),
+                completed_until_parent_id=file.parent_id,
+            )
             yield file
 
     def _manage_oauth_retrieval(

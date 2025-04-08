@@ -43,6 +43,7 @@ from onyx.chat.prompt_builder.answer_prompt_builder import default_build_user_me
 from onyx.configs.chat_configs import CHAT_TARGET_CHUNK_PERCENTAGE
 from onyx.configs.chat_configs import DISABLE_LLM_CHOOSE_SEARCH
 from onyx.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT
+from onyx.configs.chat_configs import SELECTED_SECTIONS_MAX_WINDOW_PERCENTAGE
 from onyx.configs.constants import AGENT_SEARCH_INITIAL_KEY
 from onyx.configs.constants import BASIC_KEY
 from onyx.configs.constants import MessageType
@@ -692,8 +693,13 @@ def stream_chat_message_objects(
                 doc_identifiers=identifier_tuples,
                 document_index=document_index,
             )
+
+            # Add a maximum context size in the case of user-selected docs to prevent
+            # slight inaccuracies in context window size pruning from causing
+            # the entire query to fail
             document_pruning_config = DocumentPruningConfig(
-                is_manually_selected_docs=True
+                is_manually_selected_docs=True,
+                max_window_percentage=SELECTED_SECTIONS_MAX_WINDOW_PERCENTAGE,
             )
 
             # In case the search doc is deleted, just don't include it
@@ -788,10 +794,10 @@ def stream_chat_message_objects(
                 final_msg.prompt,
                 prompt_override=prompt_override,
             )
-        elif final_msg.prompt:
-            prompt_config = PromptConfig.from_model(final_msg.prompt)
         else:
-            prompt_config = PromptConfig.from_model(persona.prompts[0])
+            prompt_config = PromptConfig.from_model(
+                final_msg.prompt or persona.prompts[0]
+            )
 
         answer_style_config = AnswerStyleConfig(
             citation_config=CitationConfig(
@@ -1083,14 +1089,10 @@ def stream_chat_message_objects(
                         selected_search_docs=selected_db_search_docs,
                         # Deduping happens at the last step to avoid harming quality by dropping content early on
                         # Skip deduping completely for ordering-only mode to save time
-                        dedupe_docs=(
-                            False
-                            if search_for_ordering_only
-                            else (
-                                retrieval_options.dedupe_docs
-                                if retrieval_options
-                                else False
-                            )
+                        dedupe_docs=bool(
+                            not search_for_ordering_only
+                            and retrieval_options
+                            and retrieval_options.dedupe_docs
                         ),
                         user_files=user_file_files if search_for_ordering_only else [],
                         loaded_user_files=user_files
