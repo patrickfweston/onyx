@@ -32,6 +32,7 @@ from onyx.connectors.onyx_jira.utils import best_effort_basic_expert_info
 from onyx.connectors.onyx_jira.utils import best_effort_get_field_from_issue
 from onyx.connectors.onyx_jira.utils import build_jira_client
 from onyx.connectors.onyx_jira.utils import build_jira_url
+from onyx.connectors.onyx_jira.utils import CustomFieldExtractor
 from onyx.connectors.onyx_jira.utils import extract_text_from_adf
 from onyx.connectors.onyx_jira.utils import get_comment_strs
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
@@ -153,6 +154,68 @@ def process_jira_issue(
         metadata_dict[_FIELD_DUEDATE] = duedate
     if issuetype := best_effort_get_field_from_issue(issue, _FIELD_ISSUETYPE):
         metadata_dict[_FIELD_ISSUETYPE] = issuetype.name
+
+    # Get all custom fields
+    custom_fields_dict = CustomFieldExtractor.get_all_custom_fields(jira_client)
+    # Extract custom field values for the issue
+    issue_custom_fields = CustomFieldExtractor.get_issue_custom_fields(
+        issue, custom_fields_dict
+    )
+    # Update metadata_dict with custom fields
+    metadata_dict.update(issue_custom_fields)
+
+    # Get a string representation for the sprint.
+    sprint_field_id = next(
+        (key for key, value in custom_fields_dict.items() if value == "Sprint"), None
+    )
+    if sprint_field_id:
+        sprint_field = best_effort_get_field_from_issue(issue, sprint_field_id)
+        if sprint_field:
+            # Jira can return a list of sprints
+            if isinstance(sprint_field, list):
+                sprint_names = [
+                    sprint.name for sprint in sprint_field if hasattr(sprint, "name")
+                ]
+                metadata_dict["Sprint"] = ", ".join(
+                    sprint_names
+                )  # Combine names if multiple sprints
+            elif hasattr(sprint_field, "name"):
+                metadata_dict["Sprint"] = sprint_field.name
+            else:
+                metadata_dict["Sprint"] = str(sprint_field)  # Or handle as needed
+    else:
+        logger.warning("Sprint field not found in custom fields.")
+
+    # Get a string representation for the parent link.
+    parent_link_field_id = next(
+        (key for key, value in custom_fields_dict.items() if value == "Parent Link"),
+        None,
+    )
+    if parent_link_field_id:
+        parent_link = best_effort_get_field_from_issue(issue, parent_link_field_id)
+        if parent_link:
+            # Assuming parent_link is an Issue object or has a similar structure
+            try:
+                parent_key = (
+                    parent_link.key
+                    if hasattr(parent_link, "key")
+                    else parent_link.raw["key"]
+                )
+                parent_summary = (
+                    parent_link.fields.summary
+                    if hasattr(parent_link.fields, "summary")
+                    else parent_link.raw["fields"]["summary"]
+                )
+                metadata_dict["Parent Link"] = f"{parent_key}: {parent_summary}"
+            except Exception as e:
+                logger.error(f"Error processing Parent Link: {e}")
+                metadata_dict["Parent Link"] = str(
+                    parent_link
+                )  # Fallback to default string representation
+        else:
+            logger.warning("Parent Link is None.")
+    else:
+        logger.warning("Parent Link field not found in custom fields.")
 
     return Document(
         id=page_url,
